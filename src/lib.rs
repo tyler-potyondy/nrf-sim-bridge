@@ -18,9 +18,6 @@
 //! ]));
 //! ```
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("nrf-sim-bridge requires Linux (BabbleSim does not support this OS)");
-
 use std::collections::HashSet;
 use std::env;
 use std::io::{BufRead, BufReader};
