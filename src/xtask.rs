@@ -379,12 +379,32 @@ fn zephyr_setup(clean: bool, mode: InstallMode) -> Result<()> {
         return fetch_prebuilt_binaries(&root, &external_dir);
     }
 
-    println!("Setting up nrf submodule...");
-    run_cmd(
-        "git",
-        &["submodule", "update", "--init", "external/nrf"],
-        Some(&root),
-    )?;
+    // Initialize the nrf submodule if it isn't already populated.
+    //
+    // Why the check: in CI we use `actions/checkout@v4` with
+    // `submodules: recursive`, which already clones `external/nrf` on the
+    // host. When `cargo xtask docker-run` bind-mounts the workspace into
+    // the container, the submodule is present but the in-container `git`
+    // does not always recognize it as a known submodule pathspec
+    // (different ownership view, different gitdir resolution, etc.), so
+    // re-running `git submodule update --init` fails with:
+    //   error: pathspec 'external/nrf' did not match any file(s) known to git
+    //
+    // Skipping the call when the submodule is already populated avoids
+    // that failure and is also faster for the common dev-loop case.
+    let nrf_dir = external_dir.join("nrf");
+    let nrf_initialized = nrf_dir.join(".git").exists();
+    if nrf_initialized {
+        println!("nrf submodule already initialized at {} — skipping init.",
+                 nrf_dir.display());
+    } else {
+        println!("Setting up nrf submodule...");
+        run_cmd(
+            "git",
+            &["submodule", "update", "--init", "external/nrf"],
+            Some(&root),
+        )?;
+    }
 
     let venv_dir = external_dir.join(".venv");
     let venv_python = venv_dir.join("bin/python3");
