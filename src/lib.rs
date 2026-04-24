@@ -58,7 +58,7 @@ impl TestProcesses {
 
     /// Like [`search_stdout_for_strings`] but with a caller-supplied timeout.
     /// Useful in tests to avoid 30-second waits.
-    fn search_stdout_with_timeout(&mut self, expected: HashSet<&str>, timeout: Duration) {
+    pub fn search_stdout_with_timeout(&mut self, expected: HashSet<&str>, timeout: Duration) {
         let start = Instant::now();
 
         loop {
