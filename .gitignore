@@ -1,2 +1,7 @@
 target
-external
+
+# external/ holds Zephyr/BabbleSim build artifacts (.venv, build/, tools/,
+# zephyr/, modules/, etc.). The only tracked entry is the `external/nrf`
+# submodule, so ignore everything in external/ except it.
+external/*
+!external/nrf
