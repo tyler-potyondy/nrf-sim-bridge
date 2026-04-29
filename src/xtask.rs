@@ -24,8 +24,11 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// Boxed error type used by all public functions in this module.
 pub type DynError = Box<dyn std::error::Error>;
@@ -83,6 +86,21 @@ fn run() -> Result<()> {
             let cgm_peripheral = args.iter().any(|a| a == "--cgm-peripheral");
             run_bsim(nrf_rpc_server, cgm_peripheral)
         }
+        "start-sim" => {
+            require_linux("start-sim")?;
+            let args: Vec<String> = args.collect();
+            let sim_id = parse_sim_flag(&args, "--sim-id").unwrap_or("insulin_pump");
+            let sim_dir = parse_sim_flag(&args, "--sim-dir")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp/nrf-sim-bridge"));
+            cmd_start_sim(sim_id, &sim_dir)
+        }
+        "stop-sim" => {
+            require_linux("stop-sim")?;
+            let args: Vec<String> = args.collect();
+            let sim_id = parse_sim_flag(&args, "--sim-id").unwrap_or("insulin_pump");
+            cmd_stop_sim(sim_id)
+        }
         "docker-build" => docker_build(),
         "docker-attach" => docker_attach(),
         "docker-run" => {
@@ -121,6 +139,14 @@ fn print_usage() {
     println!("  run-bsim                          Run BabbleSim simulation (Linux only)");
     println!("    --nrf-rpc-server                Launch the nRF RPC server (default: on)");
     println!("    --cgm-peripheral                Launch the CGM peripheral sample (default: on)");
+    println!();
+    println!("  start-sim                         Start simulation stack in the background (Linux only)");
+    println!("    --sim-id <id>                   Simulation identifier (default: insulin_pump)");
+    println!("    --sim-dir <path>                Directory for the socket file (default: /tmp/nrf-sim-bridge)");
+    println!("    Prints the socket path on success.");
+    println!();
+    println!("  stop-sim                          Stop a running simulation (Linux only)");
+    println!("    --sim-id <id>                   Simulation identifier to stop (default: insulin_pump)");
 }
 
 fn require_linux(cmd: &str) -> Result<()> {
@@ -593,6 +619,147 @@ pub fn zephyr_setup(root: &Path, clean: bool, mode: InstallMode) -> Result<()> {
     )?;
 
     println!("Done. Build artifacts copied to external/tools/bsim/bin/");
+    Ok(())
+}
+
+// ── Sim-management subcommands ────────────────────────────────────────────────
+
+/// Return the value that follows `flag` in `args`, if present.
+fn parse_sim_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].as_str())
+}
+
+/// `cargo xtask start-sim` — launch the full simulation stack in the background.
+///
+/// Spawns PHY + `zephyr_rpc_server_app` + `cgm_peripheral_sample` + `socat`,
+/// waits until the UNIX socket at `<sim_dir>/<sim_id>.sock` is connectable,
+/// then prints the socket path and exits, leaving all child processes running.
+fn cmd_start_sim(sim_id: &str, sim_dir: &Path) -> Result<()> {
+    fs::create_dir_all(sim_dir)?;
+    let socket_path = sim_dir.join(format!("{sim_id}.sock"));
+    let _ = fs::remove_file(&socket_path);
+
+    // Kill any orphaned processes from a previous run before starting fresh.
+    crate::kill_stale_sim_processes(sim_id);
+
+    let bsim_bin = Path::new("external/tools/bsim/bin");
+    let bsim_out = "external/tools/bsim";
+    let bsim_comp = "external/tools/bsim/components";
+    let ld_path = bsim_ld_library_path();
+
+    // ── 1. PHY ──────────────────────────────────────────────────────────────
+    Command::new("./bs_2G4_phy_v1")
+        .args([
+            &format!("-s={sim_id}"),
+            "-D=2",
+            "-sim_length=86400e6",
+        ])
+        .current_dir(bsim_bin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("BSIM_OUT_PATH", bsim_out)
+        .env("BSIM_COMPONENTS_PATH", bsim_comp)
+        .env("LD_LIBRARY_PATH", &ld_path)
+        .spawn()
+        .map_err(|e| format!("failed to spawn bs_2G4_phy_v1: {e}"))?;
+
+    // ── 2. Zephyr RPC server (stdout piped for PTY discovery) ────────────────
+    let (pty_tx, pty_rx) = mpsc::channel::<PathBuf>();
+    let mut zephyr_proc = Command::new("./zephyr_rpc_server_app")
+        .args([
+            &format!("-s={sim_id}"),
+            "-d=0",
+            "-uart0_pty",
+            "-uart_pty_pollT=1000",
+        ])
+        .current_dir(bsim_bin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("BSIM_OUT_PATH", bsim_out)
+        .env("BSIM_COMPONENTS_PATH", bsim_comp)
+        .env("LD_LIBRARY_PATH", &ld_path)
+        .spawn()
+        .map_err(|e| format!("failed to spawn zephyr_rpc_server_app: {e}"))?;
+
+    let zephyr_stdout = zephyr_proc.stdout.take().expect("stdout was piped");
+    std::thread::spawn(move || {
+        let reader = io::BufReader::new(zephyr_stdout);
+        for line in reader.lines() {
+            let line = match line { Ok(l) => l, Err(_) => break };
+            if let Some(idx) = line.find("connected to pseudotty: ") {
+                let pty_str = line[idx + "connected to pseudotty: ".len()..].trim();
+                let _ = pty_tx.send(PathBuf::from(pty_str));
+                break;
+            }
+        }
+    });
+
+    // ── 3. CGM peripheral ────────────────────────────────────────────────────
+    Command::new("./cgm_peripheral_sample")
+        .args([&format!("-s={sim_id}"), "-d=1"])
+        .current_dir(bsim_bin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("BSIM_OUT_PATH", bsim_out)
+        .env("BSIM_COMPONENTS_PATH", bsim_comp)
+        .env("LD_LIBRARY_PATH", &ld_path)
+        .spawn()
+        .map_err(|e| format!("failed to spawn cgm_peripheral_sample: {e}"))?;
+
+    // ── 4. Wait for PTY path ─────────────────────────────────────────────────
+    let pty_path = pty_rx
+        .recv_timeout(Duration::from_secs(30))
+        .map_err(|_| {
+            "timed out waiting for zephyr_rpc_server_app to announce its UART PTY path \
+             (expected stdout line containing \"connected to pseudotty: \")"
+        })?;
+
+    // ── 5. socat: bridge PTY → UNIX socket ───────────────────────────────────
+    let socket_path_str = socket_path
+        .to_str()
+        .ok_or("socket path contains non-UTF-8 characters")?;
+    let pty_path_str = pty_path
+        .to_str()
+        .ok_or("PTY path contains non-UTF-8 characters")?;
+
+    Command::new("socat")
+        .arg(format!("UNIX-LISTEN:{socket_path_str},fork"))
+        .arg(format!("{pty_path_str},raw,echo=0"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn socat (is it installed?): {e}"))?;
+
+    // ── 6. Wait until the socket is connectable ──────────────────────────────
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if UnixStream::connect(&socket_path).is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for socket {} to become connectable",
+                socket_path.display()
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    println!("{}", socket_path.display());
+    Ok(())
+}
+
+/// `cargo xtask stop-sim` — kill all processes belonging to a running simulation.
+fn cmd_stop_sim(sim_id: &str) -> Result<()> {
+    crate::kill_stale_sim_processes(sim_id);
+    println!("Stopped simulation '{sim_id}'");
     Ok(())
 }
 

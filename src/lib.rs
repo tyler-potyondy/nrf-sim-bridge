@@ -185,7 +185,7 @@ where
 /// Kills any leftover BabbleSim processes from a previous run with the given
 /// `sim_id`. Debugger stops and abnormal exits leave orphaned child processes
 /// that hold the sim_id and block the next launch.
-fn kill_stale_sim_processes(sim_id: &str) {
+pub(crate) fn kill_stale_sim_processes(sim_id: &str) {
     let patterns = [
         format!("bs_2G4_phy_v1.*-s={sim_id}"),
         format!("zephyr_rpc_server_app.*-s={sim_id}"),
