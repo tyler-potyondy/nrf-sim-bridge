@@ -92,21 +92,27 @@ fn run() -> Result<()> {
             let args: Vec<String> = args.collect();
             let sim_id = parse_sim_flag(&args, "--sim-id").unwrap_or("sim");
             let use_docker = args.iter().any(|a| a == "--container");
+            let log_stream = args.iter().any(|a| a == "--log-stream");
+            let log_dir = parse_sim_flag(&args, "--log-dir").map(PathBuf::from);
             if use_docker {
-                cmd_start_sim_in_docker(sim_id)
+                // Default to a path inside the container (workspace is
+                // bind-mounted at /workspace).
+                let log_dir = log_dir.unwrap_or_else(|| {
+                    PathBuf::from("/workspace/tests/sockets/logs")
+                });
+                cmd_start_sim_in_docker(sim_id, log_stream, &log_dir)
             } else {
                 require_linux("start-sim")?;
                 let root = workspace_root()?;
                 let sim_dir = parse_sim_flag(&args, "--sim-dir")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| root.join("tests/sockets"));
-                let log_stream = args.iter().any(|a| a == "--log-stream");
-                let log_dir = parse_sim_flag(&args, "--log-dir").map(PathBuf::from);
-                let log = match (log_stream, log_dir) {
-                    (true, Some(dir)) => crate::LogOutput::Both(dir),
-                    (true, None) => crate::LogOutput::Stream,
-                    (false, Some(dir)) => crate::LogOutput::WriteToDir(dir),
-                    (false, None) => crate::LogOutput::Off,
+                // Default to a "logs" subdirectory next to the socket file.
+                let log_dir = log_dir.unwrap_or_else(|| sim_dir.join("logs"));
+                let log = if log_stream {
+                    crate::LogOutput::Both(log_dir)
+                } else {
+                    crate::LogOutput::WriteToDir(log_dir)
                 };
                 cmd_start_sim(sim_id, &sim_dir, log)
             }
@@ -116,6 +122,18 @@ fn run() -> Result<()> {
             let args: Vec<String> = args.collect();
             let sim_id = parse_sim_flag(&args, "--sim-id").unwrap_or("insulin_pump");
             cmd_stop_sim(sim_id)
+        }
+        "tail-logs" => {
+            let args: Vec<String> = args.collect();
+            let log_dir = parse_sim_flag(&args, "--log-dir")
+                .map(PathBuf::from)
+                .ok_or("tail-logs requires --log-dir <path>")?;
+            let use_docker = args.iter().any(|a| a == "--container");
+            if use_docker {
+                cmd_tail_logs_in_docker(&log_dir)
+            } else {
+                cmd_tail_logs(&log_dir)
+            }
         }
         "clean-sockets" => {
             let root = workspace_root()?;
@@ -177,13 +195,17 @@ fn print_usage() {
     println!("    --sim-dir <path>                Directory for the socket file (default: <workspace>/tests/sockets)");
     println!("    --container                     Build image if needed and run inside a container (macOS)");
     println!("    --log-stream                    Stream all process output to this terminal with [label] prefixes");
-    println!("    --log-dir <path>                Write each process's output to <path>/{{rpc-server,cgm,phy}}.log");
-    println!("                                    (logs are truncated at the start of each run; combine with");
-    println!("                                     --log-stream to both stream and write files simultaneously)");
+    println!("    --log-dir <path>                Directory for log files (default: <sim-dir>/logs);");
+    println!("                                    writes rpc-server.log, cgm.log, phy.log; truncated each run;");
+    println!("                                    combine with --log-stream to also stream to terminal");
     println!("    Prints the socket path on success.");
     println!();
     println!("  stop-sim                          Stop a running simulation (Linux only)");
     println!("    --sim-id <id>                   Simulation identifier to stop (default: insulin_pump)");
+    println!();
+    println!("  tail-logs                         Follow log files written by --log-dir (blocks until Ctrl+C)");
+    println!("    --log-dir <path>                Directory containing {{rpc-server,cgm,phy}}.log");
+    println!("    --container                     Follow logs inside the running sim container");
     println!();
     println!("  clean-sockets                     Remove all *.sock files from <workspace>/tests/sockets/");
     println!();
@@ -856,7 +878,7 @@ fn container_port(workspace: &str) -> u16 {
 /// then exec `start-sim` inside it so Linux-only sim processes stay alive after
 /// this command returns. The workspace bind-mount means the socket file appears
 /// in `tests/sockets/` on the host as well.
-fn cmd_start_sim_in_docker(sim_id: &str) -> Result<()> {
+fn cmd_start_sim_in_docker(sim_id: &str, log_stream: bool, log_dir: &Path) -> Result<()> {
     let root = workspace_root()?;
     let workspace = root
         .to_str()
@@ -945,12 +967,19 @@ fn cmd_start_sim_in_docker(sim_id: &str) -> Result<()> {
         ],
         Some(&root),
     );
+    // Build the start-sim command, forwarding log flags to the container.
+    let log_dir_str = log_dir.to_str().ok_or("--log-dir path contains non-UTF-8 characters")?;
+    let mut start_sim_cmd =
+        format!("cargo xtask start-sim --sim-id {sim_id} --log-dir {log_dir_str}");
+    if log_stream {
+        start_sim_cmd.push_str(" --log-stream");
+    }
     run_cmd(
         "docker",
         &[
             "exec",
             container_name,
-            "bash", "-lc", &format!("cargo xtask start-sim --sim-id {sim_id}"),
+            "bash", "-lc", &start_sim_cmd,
         ],
         Some(&root),
     )?;
@@ -972,6 +1001,51 @@ fn cmd_start_sim_in_docker(sim_id: &str) -> Result<()> {
 
     println!("TCP bridge ready: connect from macOS at 127.0.0.1:{port}");
     Ok(())
+}
+
+/// `cargo xtask tail-logs` — follow the three log files produced by `--log-dir`
+/// until the user presses Ctrl+C.
+fn cmd_tail_logs(log_dir: &Path) -> Result<()> {
+    let rpc_log = log_dir.join("rpc-server.log");
+    let cgm_log = log_dir.join("cgm.log");
+    let phy_log = log_dir.join("phy.log");
+    run_cmd(
+        "tail",
+        &[
+            "-f",
+            rpc_log.to_str().ok_or("rpc-server.log path is not valid UTF-8")?,
+            cgm_log.to_str().ok_or("cgm.log path is not valid UTF-8")?,
+            phy_log.to_str().ok_or("phy.log path is not valid UTF-8")?,
+        ],
+        None,
+    )
+}
+
+/// `cargo xtask tail-logs --container` — follow log files inside the running
+/// sim container (useful from macOS when the sim runs in Docker).
+fn cmd_tail_logs_in_docker(log_dir: &Path) -> Result<()> {
+    let root = workspace_root()?;
+    let workspace = root
+        .to_str()
+        .ok_or("Workspace path contains non-UTF-8 characters")?;
+    let hash = format!(
+        "{:x}",
+        workspace
+            .bytes()
+            .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64))
+    );
+    let container_name = format!("babble-bridge-{}", &hash[..8]);
+    let log_dir_str = log_dir
+        .to_str()
+        .ok_or("--log-dir path contains non-UTF-8 characters")?;
+    let tail_cmd = format!(
+        "tail -f {log_dir_str}/rpc-server.log {log_dir_str}/cgm.log {log_dir_str}/phy.log"
+    );
+    run_cmd(
+        "docker",
+        &["exec", "-it", &container_name, "bash", "-lc", &tail_cmd],
+        Some(&root),
+    )
 }
 
 /// `cargo xtask exec` — run an arbitrary command inside the existing sim

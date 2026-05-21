@@ -95,6 +95,7 @@ to fetch Linux binaries.
 | `cargo xtask start-sim` | Start PHY + Zephyr RPC server + CGM peripheral + socat bridge (Linux only) |
 | `cargo xtask start-sim --container` | Same, but runs inside a managed container (macOS) |
 | `cargo xtask stop-sim` | Kill simulation processes and clean up BabbleSim IPC |
+| `cargo xtask tail-logs --log-dir <path>` | Follow log files live (Ctrl+C to stop); add `--container` on macOS |
 | `cargo xtask clean-sockets` | Remove all `*.sock` files from `tests/sockets/` |
 
 Options for `start-sim`:
@@ -103,11 +104,60 @@ Options for `start-sim`:
 --sim-id <id>       Socket name and BabbleSim identifier (default: sim)
 --sim-dir <path>    Directory for the socket file (default: <workspace>/tests/sockets)
 --container         Build image if needed and run inside a container (macOS)
---log-stream        Stream all process output to the terminal with [label] prefixes
---log-dir <path>    Write rpc-server.log, cgm.log, phy.log into <path> (truncated each run)
+--log-stream        Also stream all process output to the terminal with [label] prefixes
+--log-dir <path>    Directory for log files (default: <sim-dir>/logs);
+                    writes rpc-server.log, cgm.log, phy.log; truncated each run
 ```
 
-`--log-stream` and `--log-dir` can be combined to stream and write files simultaneously.
+`start-sim` **exits immediately** after spawning the simulation processes — it does not block.
+The child processes (PHY, Zephyr RPC server, CGM peripheral) keep running in the background
+and write their logs directly to files. Logging is on by default; pass `--log-dir` only to
+override the location.
+
+### Watching logs
+
+Because `start-sim` exits right away, `--log-stream` only shows the brief startup window.
+For sustained log viewing, use `tail-logs` after starting the sim.
+
+**Linux:**
+
+```bash
+# Terminal 1 — start the sim (returns immediately)
+cargo xtask start-sim --sim-id sim
+# Logs are now being written to tests/sockets/logs/
+
+# Terminal 2 — follow the logs live (Ctrl+C to stop)
+cargo xtask tail-logs --log-dir tests/sockets/logs
+```
+
+Or chain them in one terminal:
+
+```bash
+cargo xtask start-sim --sim-id sim && \
+  cargo xtask tail-logs --log-dir tests/sockets/logs
+```
+
+**macOS (container):**
+
+```bash
+# Terminal 1 — start the sim inside Docker (returns immediately)
+cargo xtask start-sim --container --sim-id sim
+# Logs are written to /workspace/tests/sockets/logs/ inside the container
+
+# Terminal 2 — follow the logs from macOS
+cargo xtask tail-logs --log-dir /workspace/tests/sockets/logs --container
+```
+
+The three log files written are:
+
+| File | Process |
+|------|---------|
+| `rpc-server.log` | Zephyr RPC server (stdout + stderr — Zephyr `<inf>` log lines, PTY announcements) |
+| `cgm.log` | CGM peripheral sample (stdout + stderr) |
+| `phy.log` | BabbleSim PHY (`bs_2G4_phy_v1` stderr) |
+
+All three are **truncated at the start of each `start-sim` run** and written via inherited file
+descriptors, so they continue growing even after the `start-sim` process exits.
 
 The socket is created at `tests/sockets/<sim-id>.sock`.
 
@@ -190,8 +240,8 @@ processes.search_stdout_for_strings(HashSet::from([
 |---|---|
 | `LogOutput::Off` | Silent — no forwarding (default) |
 | `LogOutput::Stream` | Real-time `[label]` prefixed output to terminal (bypasses `cargo test` capture) |
-| `LogOutput::WriteToDir(path)` | Writes `rpc-server.log`, `cgm.log`, `phy.log` into `path`; **files are truncated on every spawn** |
-| `LogOutput::Both(path)` | Streams to terminal AND writes to files simultaneously |
+| `LogOutput::WriteToDir(path)` | Writes `rpc-server.log`, `cgm.log`, `phy.log` into `path`; **truncated on every spawn**; child processes hold the file descriptors directly so **logs persist after the parent process exits** |
+| `LogOutput::Both(path)` | Same persistent file logging as `WriteToDir`, plus real-time terminal streaming while the parent is alive |
 
 ```rust
 // Verbose during interactive debugging:

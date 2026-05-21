@@ -302,6 +302,15 @@ pub fn spawn_zephyr_rpc_server_with_socat(
     log: LogOutput,
 ) -> (TestProcesses, PathBuf) {
     let verbose = matches!(log, LogOutput::Stream | LogOutput::Both(_));
+    // In persistent mode the child processes write directly to open file
+    // descriptors that they inherit from us.  Because the FD lives in the
+    // child process (not in a parent-side thread), logging continues even
+    // after `start-sim` exits and the parent process is gone.  This is the
+    // correct mode for `cargo xtask start-sim --log-dir …`.
+    // In non-persistent (Stream) mode we use pipes + background threads,
+    // which is correct for in-process test usage where the parent stays
+    // alive for the whole test.
+    let persistent = matches!(log, LogOutput::WriteToDir(_) | LogOutput::Both(_));
     let log_dir: Option<PathBuf> = match &log {
         LogOutput::WriteToDir(p) | LogOutput::Both(p) => Some(p.clone()),
         _ => None,
@@ -340,7 +349,20 @@ pub fn spawn_zephyr_rpc_server_with_socat(
     let _ = std::fs::remove_file(&socket_path);
 
     // ── 1. PHY ──────────────────────────────────────────────────────────────
-    let needs_phy_pipe = verbose || log_dir.is_some();
+    // Persistent mode: pass an open file FD directly to the child so it
+    // keeps writing after the parent exits.  Non-persistent: use a pipe so
+    // the parent thread can label and forward lines to /dev/stderr.
+    let phy_stderr: Stdio = if persistent {
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log_dir.as_ref().unwrap().join("phy.log"))
+            .unwrap_or_else(|e| panic!("could not open phy.log: {e}"));
+        Stdio::from(f)
+    } else if verbose {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
     let mut phy = Command::new("./bs_2G4_phy_v1")
         .args([
             &format!("-s={sim_id}"),
@@ -350,24 +372,33 @@ pub fn spawn_zephyr_rpc_server_with_socat(
         .current_dir(bsim_bin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(if needs_phy_pipe { Stdio::piped() } else { Stdio::null() })
+        .stderr(phy_stderr)
         .env("BSIM_OUT_PATH", bsim_out)
         .env("BSIM_COMPONENTS_PATH", bsim_comp)
         .env("LD_LIBRARY_PATH", &ld_path)
         .process_group(0)
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn bs_2G4_phy_v1: {e}"));
+    // Only reached when verbose && !persistent (pipe was opened above).
     if let Some(stderr) = phy.stderr.take() {
-        if verbose { pipe_labeled(stderr, "babblesim-phy"); }
-        else if let Some(ref dir) = log_dir { pipe_to_file(stderr, dir.join("phy.log")); }
+        pipe_labeled(stderr, "babblesim-phy");
     }
 
-    // ── 2. Zephyr RPC server (stdout always piped for PTY discovery + log capture) ──
+    // ── 2. Zephyr RPC server ─────────────────────────────────────────────────
     //
-    // stdout must stay piped regardless of log mode so the PTY path can
-    // be extracted.  When verbose, the reader thread additionally forwards
-    // every line to stderr with a "[rpc-server]" prefix.  When writing to a
-    // dir, the reader thread also writes every line to rpc-server.log.
+    // Stdout must always be readable by the parent for PTY discovery, but the
+    // mechanism differs by mode:
+    //
+    //  * Non-persistent (Off / Stream): pipe stdout → background thread
+    //    (PTY discovery + stdout_lines + optional /dev/stderr labelling).
+    //    Dies when the parent exits.
+    //
+    //  * Persistent (WriteToDir / Both): redirect stdout directly to
+    //    rpc-server.log via an inherited FD so Zephyr keeps writing after
+    //    the parent exits.  A background thread reads the *growing file*
+    //    (tail-f style) for PTY discovery + stdout_lines + optional stderr
+    //    labelling.  Stderr is also redirected to the same file so all Zephyr
+    //    output is in one place.
     let stdout_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let (pty_tx, pty_rx) = std::sync::mpsc::channel::<PathBuf>();
 
@@ -376,7 +407,31 @@ pub fn spawn_zephyr_rpc_server_with_socat(
     // Without it, isatty() returns 0 on a pipe and colors are stripped.
     let zephyr_color_arg: &[&str] = if verbose { &["-force-color"] } else { &[] };
 
-    let needs_zephyr_stderr = verbose || log_dir.is_some();
+    let (zephyr_stdout_stdio, zephyr_rpc_log_path): (Stdio, Option<PathBuf>) = if persistent {
+        let log_path = log_dir.as_ref().unwrap().join("rpc-server.log");
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap_or_else(|e| panic!("could not open rpc-server.log for writing: {e}"));
+        (Stdio::from(f), Some(log_path))
+    } else {
+        (Stdio::piped(), None)
+    };
+
+    // Zephyr stderr: in persistent mode redirect to the same rpc-server.log
+    // so all output is in one file.  In Stream mode pipe it for labelling.
+    let zephyr_stderr_stdio: Stdio = if persistent {
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log_dir.as_ref().unwrap().join("rpc-server.log"))
+            .unwrap_or_else(|e| panic!("could not open rpc-server.log for stderr: {e}"));
+        Stdio::from(f)
+    } else if verbose {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+
     let mut zephyr_proc = Command::new("./zephyr_rpc_server_app")
         .args([
             &format!("-s={sim_id}"),
@@ -387,8 +442,8 @@ pub fn spawn_zephyr_rpc_server_with_socat(
         .args(zephyr_color_arg)
         .current_dir(bsim_bin)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(if needs_zephyr_stderr { Stdio::piped() } else { Stdio::null() })
+        .stdout(zephyr_stdout_stdio)
+        .stderr(zephyr_stderr_stdio)
         .env("BSIM_OUT_PATH", bsim_out)
         .env("BSIM_COMPONENTS_PATH", bsim_comp)
         .env("LD_LIBRARY_PATH", &ld_path)
@@ -396,67 +451,134 @@ pub fn spawn_zephyr_rpc_server_with_socat(
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn zephyr_rpc_server_app: {e}"));
 
-    // Drain Zephyr stderr (kernel/driver logs).
+    // Drain Zephyr stderr via pipe only in Stream mode (non-persistent).
+    // In persistent mode the child writes directly to rpc-server.log.
     if let Some(stderr) = zephyr_proc.stderr.take() {
-        if verbose { pipe_labeled(stderr, "rpc-server"); }
-        else if let Some(ref dir) = log_dir { pipe_to_file(stderr, dir.join("rpc-server.log")); }
+        // Only reached when verbose && !persistent.
+        pipe_labeled(stderr, "rpc-server");
     }
 
-    // Drain Zephyr stdout in a background thread:
-    // - send the PTY path once via `pty_tx` when the "pseudotty" line appears
-    // - append every line to the shared `stdout_lines` buffer
-    // - when verbose, also forward each line to stderr with a "[rpc-server]" prefix
-    // - when writing to dir, also write every line to rpc-server.log
-    let zephyr_stdout = zephyr_proc.stdout.take().expect("stdout was piped");
     let stdout_lines_clone = Arc::clone(&stdout_lines);
-    let rpc_log_path = log_dir.as_ref().map(|d| d.join("rpc-server.log"));
-    std::thread::spawn(move || {
-        use std::io::Write;
-        // Same /dev/stderr trick as pipe_labeled — bypasses cargo test capture.
-        let mut real_stderr = verbose.then(|| {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/stderr")
-                .expect("open /dev/stderr")
-        });
-        let mut log_file = rpc_log_path.as_ref().map(|p| {
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(p)
-                .unwrap_or_else(|e| panic!("could not open rpc-server.log: {e}"))
-        });
-        let reader = BufReader::new(zephyr_stdout);
-        let mut pty_sent = false;
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
+    if let Some(rpc_log_path) = zephyr_rpc_log_path {
+        // ── Persistent path: read the growing log file (tail-f style) ────────
+        //
+        // Zephyr writes to rpc-server.log via its inherited stdout FD.  We
+        // open the same file for reading in a thread.  When read_line() hits
+        // EOF it means no new data has arrived yet — we sleep briefly and
+        // retry.  Because the FD is inherited by Zephyr (not held by this
+        // thread), it stays open and Zephyr continues writing even after this
+        // thread (and the parent process) exits.
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let mut real_stderr = verbose.then(|| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/stderr")
+                    .expect("open /dev/stderr")
+            });
+            // Wait for the file to be openable (it was just created above, so
+            // this should succeed immediately, but be defensive).
+            let file = loop {
+                match std::fs::File::open(&rpc_log_path) {
+                    Ok(f) => break f,
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
             };
-            // PTY discovery: nsi_print_trace writes to stdout
-            // format: "<uart_name> connected to pseudotty: <slave_path>"
-            if !pty_sent {
-                if let Some(idx) = line.find("connected to pseudotty: ") {
-                    let pty_path_str = line[idx + "connected to pseudotty: ".len()..].trim();
-                    let pty_path = PathBuf::from(pty_path_str);
-                    let _ = pty_tx.send(pty_path);
-                    pty_sent = true;
+            let mut reader = BufReader::new(file);
+            let mut pty_sent = false;
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        // No new data yet — wait and retry.
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Ok(_) => {
+                        let line = line
+                            .trim_end_matches('\n')
+                            .trim_end_matches('\r')
+                            .to_string();
+                        if !pty_sent {
+                            if let Some(idx) = line.find("connected to pseudotty: ") {
+                                let pty_str =
+                                    line[idx + "connected to pseudotty: ".len()..].trim();
+                                let _ = pty_tx.send(PathBuf::from(pty_str));
+                                pty_sent = true;
+                            }
+                        }
+                        if let Some(ref mut out) = real_stderr {
+                            let _ = writeln!(out, "[rpc-server] {line}");
+                        }
+                        stdout_lines_clone.lock().unwrap().push(line);
+                    }
+                    Err(_) => break,
                 }
             }
-            if let Some(ref mut out) = real_stderr {
-                let _ = writeln!(out, "[rpc-server] {line}");
+        });
+    } else {
+        // ── Non-persistent path: drain piped stdout in a background thread ───
+        let zephyr_stdout = zephyr_proc.stdout.take().expect("stdout was piped");
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let mut real_stderr = verbose.then(|| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/stderr")
+                    .expect("open /dev/stderr")
+            });
+            let reader = BufReader::new(zephyr_stdout);
+            let mut pty_sent = false;
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                // PTY discovery: nsi_print_trace writes to stdout.
+                // format: "<uart_name> connected to pseudotty: <slave_path>"
+                if !pty_sent {
+                    if let Some(idx) = line.find("connected to pseudotty: ") {
+                        let pty_path_str =
+                            line[idx + "connected to pseudotty: ".len()..].trim();
+                        let pty_path = PathBuf::from(pty_path_str);
+                        let _ = pty_tx.send(pty_path);
+                        pty_sent = true;
+                    }
+                }
+                if let Some(ref mut out) = real_stderr {
+                    let _ = writeln!(out, "[rpc-server] {line}");
+                }
+                stdout_lines_clone.lock().unwrap().push(line);
             }
-            if let Some(ref mut f) = log_file {
-                let _ = writeln!(f, "{line}");
-            }
-            stdout_lines_clone.lock().unwrap().push(line);
-        }
-    });
+        });
+    }
 
     // ── 3. CGM peripheral ────────────────────────────────────────────────────
-    // When verbose or writing to a log dir, pipe stdout/stderr so we can
-    // forward them.  Otherwise redirect to a local fallback log file (old
-    // behaviour) so the process doesn't block writing to a closed pipe.
-    let mut cgm = if verbose || log_dir.is_some() {
+    //
+    // Persistent mode: redirect stdout and stderr directly to cgm.log via
+    // inherited FDs — no parent-side thread required, writes survive parent
+    // exit.  Non-persistent verbose: pipe + label.  Off: redirect to a
+    // local fallback file so the process doesn't block on a broken pipe.
+    let mut cgm = if persistent {
+        let cgm_out = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log_dir.as_ref().unwrap().join("cgm.log"))
+            .unwrap_or_else(|e| panic!("could not open cgm.log: {e}"));
+        let cgm_err = cgm_out
+            .try_clone()
+            .expect("could not clone cgm.log file handle");
+        Command::new("./cgm_peripheral_sample")
+            .args([&format!("-s={sim_id}"), "-d=1"])
+            .current_dir(bsim_bin)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(cgm_out))
+            .stderr(Stdio::from(cgm_err))
+            .env("BSIM_OUT_PATH", bsim_out)
+            .env("BSIM_COMPONENTS_PATH", bsim_comp)
+            .env("LD_LIBRARY_PATH", &ld_path)
+            .process_group(0)
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn cgm_peripheral_sample: {e}"))
+    } else if verbose {
         Command::new("./cgm_peripheral_sample")
             .args([&format!("-s={sim_id}"), "-d=1"])
             .current_dir(bsim_bin)
@@ -489,14 +611,10 @@ pub fn spawn_zephyr_rpc_server_with_socat(
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn cgm_peripheral_sample: {e}"))
     };
+    // Only reachable when verbose && !persistent.
     if let (Some(stdout), Some(stderr)) = (cgm.stdout.take(), cgm.stderr.take()) {
-        if verbose {
-            pipe_labeled(stdout, "cgm");
-            pipe_labeled(stderr, "cgm");
-        } else if let Some(ref dir) = log_dir {
-            pipe_to_file(stdout, dir.join("cgm.log"));
-            pipe_to_file(stderr, dir.join("cgm.log"));
-        }
+        pipe_labeled(stdout, "cgm");
+        pipe_labeled(stderr, "cgm");
     }
 
     // ── 4. Wait for PTY path ─────────────────────────────────────────────────
@@ -736,5 +854,159 @@ mod tests {
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.is_empty(), "file should be empty after File::create, got {after:?}");
+    }
+
+    // ── persistent flag (WriteToDir / Both → inherited FD mode) ──────────────
+
+    #[test]
+    fn log_output_off_is_not_persistent() {
+        let persistent = matches!(LogOutput::Off, LogOutput::WriteToDir(_) | LogOutput::Both(_));
+        assert!(!persistent);
+    }
+
+    #[test]
+    fn log_output_stream_is_not_persistent() {
+        let persistent =
+            matches!(LogOutput::Stream, LogOutput::WriteToDir(_) | LogOutput::Both(_));
+        assert!(!persistent);
+    }
+
+    #[test]
+    fn log_output_write_to_dir_is_persistent() {
+        let persistent = matches!(
+            LogOutput::WriteToDir(PathBuf::from("/tmp")),
+            LogOutput::WriteToDir(_) | LogOutput::Both(_)
+        );
+        assert!(persistent);
+    }
+
+    #[test]
+    fn log_output_both_is_persistent() {
+        let persistent = matches!(
+            LogOutput::Both(PathBuf::from("/tmp")),
+            LogOutput::WriteToDir(_) | LogOutput::Both(_)
+        );
+        assert!(persistent);
+    }
+
+    // ── tail-f style file reader (persistent PTY discovery mechanism) ─────────
+
+    /// The persistent path uses `BufReader::read_line` on a regular file.
+    /// At EOF it returns `Ok(0)`, and after the file grows it returns new
+    /// content on the next call.  This test verifies that behaviour — it is
+    /// the foundation of the tail-f reader thread in
+    /// `spawn_zephyr_rpc_server_with_socat`.
+    #[test]
+    fn tail_f_reader_sees_content_appended_after_eof() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("grow.log");
+
+        // Write the first line.
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(writer, "first line").unwrap();
+        drop(writer); // flush to disk
+
+        // Open for reading and consume the first line.
+        let file = std::fs::File::open(&path).unwrap();
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).unwrap();
+        assert!(n > 0, "expected to read first line");
+        assert_eq!(line.trim_end(), "first line");
+
+        // At EOF: read_line must return Ok(0).
+        line.clear();
+        let n = reader.read_line(&mut line).unwrap();
+        assert_eq!(n, 0, "expected Ok(0) at EOF");
+
+        // Append a second line; reader must return it on the next call.
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(writer, "second line").unwrap();
+        drop(writer);
+
+        line.clear();
+        let n = reader.read_line(&mut line).unwrap();
+        assert!(n > 0, "expected new content after file grew");
+        assert_eq!(line.trim_end(), "second line");
+    }
+
+    /// End-to-end test of the persistent PTY-discovery mechanism: a writer
+    /// thread appends lines (including a PTY announcement) to a file, while
+    /// a reader thread polls the same file tail-f style.  Mirrors exactly
+    /// what the background thread in `spawn_zephyr_rpc_server_with_socat`
+    /// does in persistent mode.
+    #[test]
+    fn tail_f_reader_discovers_pty_line_written_by_concurrent_writer() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rpc-server.log");
+
+        // Pre-create to match spawn_zephyr_rpc_server_with_socat behaviour.
+        std::fs::File::create(&path).unwrap();
+
+        // Writer: wait briefly then append preamble + PTY line.
+        let write_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&write_path)
+                .unwrap();
+            writeln!(f, "some preamble line").unwrap();
+            writeln!(f, "UART_0 connected to pseudotty: /dev/pts/42").unwrap();
+            writeln!(f, "line after pty announcement").unwrap();
+        });
+
+        // Reader: tail-f loop identical to the persistent-mode thread.
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        let read_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            let file = std::fs::File::open(&read_path).unwrap();
+            let mut reader = BufReader::new(file);
+            let start = std::time::Instant::now();
+            let mut pty_sent = false;
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        assert!(
+                            start.elapsed() < Duration::from_secs(5),
+                            "timed out waiting for PTY line"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(_) => {
+                        let line =
+                            line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+                        if !pty_sent {
+                            if let Some(idx) = line.find("connected to pseudotty: ") {
+                                let pty_str =
+                                    line[idx + "connected to pseudotty: ".len()..].trim();
+                                tx.send(PathBuf::from(pty_str)).unwrap();
+                                pty_sent = true;
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => panic!("read_line error: {e}"),
+                }
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        let pty = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("PTY path should have been sent");
+        assert_eq!(pty, PathBuf::from("/dev/pts/42"));
     }
 }
