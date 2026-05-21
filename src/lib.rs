@@ -14,13 +14,28 @@
 //!
 //! ```no_run
 //! use std::collections::HashSet;
+//! use std::os::unix::net::UnixStream;
 //! use std::path::Path;
+//! use std::time::Duration;
+//! use babble_bridge::LogOutput;
 //!
 //! let tests_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/sockets"));
 //! let (mut processes, socket_path) =
-//!     babble_bridge::spawn_zephyr_rpc_server_with_socat(tests_dir, "my_test");
+//!     babble_bridge::spawn_zephyr_rpc_server_with_socat(tests_dir, "my_test", LogOutput::Off);
 //!
-//! // … run test logic, write/read via a UnixStream to socket_path …
+//! // socat is spawned but may not be listening yet — retry until connectable.
+//! let start = std::time::Instant::now();
+//! let _socket = loop {
+//!     match UnixStream::connect(&socket_path) {
+//!         Ok(s) => break s,
+//!         Err(_) if start.elapsed() < Duration::from_secs(5) => {
+//!             std::thread::sleep(Duration::from_millis(50));
+//!         }
+//!         Err(e) => panic!("socket never became connectable: {e}"),
+//!     }
+//! };
+//!
+//! // … write/read via _socket …
 //!
 //! processes.search_stdout_for_strings(HashSet::from([
 //!     "<inf> nrf_ps_server: Initializing RPC server",

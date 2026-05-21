@@ -152,18 +152,37 @@ cargo xtask exec -- cargo run --example my_example
 
 ```rust
 use std::collections::HashSet;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Duration;
 use babble_bridge::LogOutput;
 
 let tests_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/sockets"));
 let (mut processes, socket_path) =
     babble_bridge::spawn_zephyr_rpc_server_with_socat(tests_dir, "my_test", LogOutput::Off);
 
-// Connect to socket_path with a UnixStream, run test logic, then:
+// socat needs a moment to start listening after spawn — retry until connectable.
+let start = std::time::Instant::now();
+let socket = loop {
+    match UnixStream::connect(&socket_path) {
+        Ok(s) => break s,
+        Err(_) if start.elapsed() < Duration::from_secs(5) => {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err(e) => panic!("socket never became connectable: {e}"),
+    }
+};
+
+// Run test logic via `socket`, then assert on Zephyr-side log output:
 processes.search_stdout_for_strings(HashSet::from([
     "<inf> nrf_ps_server: Initializing RPC server",
 ]));
 ```
+
+> **Note:** `spawn_zephyr_rpc_server_with_socat` returns as soon as socat is
+> *spawned*, not when the socket is *connectable*. Always use a retry loop (as
+> above) before calling `UnixStream::connect`. The `sim_harness.rs` integration
+> tests use a `SimUart::connect` helper that does exactly this.
 
 ### LogOutput — controlling where process logs go
 
