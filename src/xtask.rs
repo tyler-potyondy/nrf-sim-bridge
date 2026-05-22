@@ -123,6 +123,7 @@ fn run() -> Result<()> {
             let sim_id = parse_sim_flag(&args, "--sim-id").unwrap_or("insulin_pump");
             cmd_stop_sim(sim_id)
         }
+        "list-sims" => cmd_list_sims(),
         "tail-logs" => {
             let args: Vec<String> = args.collect();
             let log_dir = parse_sim_flag(&args, "--log-dir")
@@ -202,6 +203,8 @@ fn print_usage() {
     println!();
     println!("  stop-sim                          Stop a running simulation (Linux only)");
     println!("    --sim-id <id>                   Simulation identifier to stop (default: insulin_pump)");
+    println!();
+    println!("  list-sims                         List all currently running simulations");
     println!();
     println!("  tail-logs                         Follow log files written by --log-dir (blocks until Ctrl+C)");
     println!("    --log-dir <path>                Directory containing {{rpc-server,cgm,phy}}.log");
@@ -1084,6 +1087,66 @@ fn cmd_exec_in_container(cmd_args: &[&str]) -> Result<()> {
         &["exec", &container_name, "bash", "-lc", &shell_cmd],
         Some(&root),
     )
+}
+
+/// `cargo xtask list-sims` — show all running simulation processes.
+fn cmd_list_sims() -> Result<()> {
+    // Find running PHY processes; pgrep exits 1 when nothing matches — that's OK.
+    let output = Command::new("pgrep")
+        .args(["-fl", "bs_2G4_phy_v1"])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut sim_ids: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            // Extract -s=<sim_id> from the command-line arguments.
+            line.split_whitespace()
+                .find(|tok| tok.starts_with("-s="))
+                .map(|tok| tok[3..].to_string())
+        })
+        .collect();
+    sim_ids.sort();
+    sim_ids.dedup();
+
+    if sim_ids.is_empty() {
+        println!("No running simulations found.");
+        return Ok(());
+    }
+
+    let process_patterns: &[(&str, &str)] = &[
+        ("bs_2G4_phy_v1.*-s=", "phy"),
+        ("zephyr_rpc_server_app.*-s=", "rpc-server"),
+        ("cgm_peripheral_sample.*-s=", "cgm-peripheral"),
+        ("socat.*", "socat"),
+    ];
+
+    println!("Running simulations:");
+    for sim_id in &sim_ids {
+        let mut alive: Vec<&str> = Vec::new();
+        for (pat_prefix, label) in process_patterns {
+            let pattern = if *label == "socat" {
+                format!("{pat_prefix}{sim_id}.sock")
+            } else {
+                format!("{pat_prefix}{sim_id}")
+            };
+            let status = Command::new("pgrep")
+                .args(["-f", &pattern])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?;
+            if status.success() {
+                alive.push(label);
+            }
+        }
+        let health = if alive.len() == process_patterns.len() {
+            "healthy"
+        } else {
+            "degraded"
+        };
+        println!("  {sim_id}: {} ({health})", alive.join(", "));
+    }
+    Ok(())
 }
 
 /// `cargo xtask stop-sim` — kill all processes belonging to a running simulation.
