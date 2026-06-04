@@ -20,8 +20,12 @@
 //! use babble_bridge::LogOutput;
 //!
 //! let tests_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/sockets"));
-//! let (mut processes, socket_path) =
-//!     babble_bridge::spawn_zephyr_rpc_server_with_socat(tests_dir, "my_test", LogOutput::Off);
+//! let (mut processes, socket_path) = babble_bridge::spawn_zephyr_rpc_server_with_socat(
+//!     tests_dir,
+//!     "my_test",
+//!     LogOutput::Off,
+//!     babble_bridge::SimConfig::default(),
+//! );
 //!
 //! // socat is spawned but may not be listening yet — retry until connectable.
 //! let start = std::time::Instant::now();
@@ -44,6 +48,34 @@
 
 pub mod xtask;
 
+/// Read the real-time speed ratio written by `cargo xtask start-sim`.
+///
+/// `cargo xtask start-sim` writes `<sim_dir>/<sim_id>.speed` containing the
+/// configured `--speed` value (or `0.0` when no handbrake was used).
+///
+/// Use this from host-side library code to obtain the conversion factor:
+///
+/// ```no_run
+/// use std::path::Path;
+/// use std::time::Duration;
+///
+/// let speed = babble_bridge::read_sim_speed(
+///     Path::new("tests/sockets"),
+///     "sim",
+/// );
+/// if let Some(ratio) = speed {
+///     // ratio > 0: sleep sim_duration / ratio wall-clock seconds
+///     // ratio == 0: no handbrake — measure experimentally with run-bsim
+///     let wall = Duration::from_secs(1).div_f64(ratio.max(1.0));
+///     println!("1 simulated second ≈ {wall:?} wall time");
+/// }
+/// ```
+pub fn read_sim_speed(sim_dir: &std::path::Path, sim_id: &str) -> Option<f64> {
+    let path = sim_dir.join(format!("{sim_id}.speed"));
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents.trim().parse::<f64>().ok()
+}
+
 use std::collections::HashSet;
 use std::env;
 use std::io::{BufRead, BufReader};
@@ -54,6 +86,79 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // ── Public types ─────────────────────────────────────────────────────────────
+
+/// Timing configuration for a BabbleSim simulation run.
+///
+/// Controls how long the simulation runs in simulated time and, optionally,
+/// how fast the simulation clock advances relative to wall-clock time via
+/// [`bs_device_handbrake`](https://babblesim.github.io/).
+///
+/// Use [`SimConfig::default`] to reproduce the original behaviour: 24 hours
+/// of simulated time at unlimited speed (~2200× real time on typical hardware).
+///
+/// # BabbleSim time model
+///
+/// BabbleSim drives a **virtual clock** completely independent of the host's
+/// wall clock. By default, this clock advances as fast as the CPU allows
+/// (typically ~2200× faster than real time). The `speed` field engages
+/// `bs_device_handbrake` to throttle the simulation to any desired ratio:
+///
+/// | `speed`       | behaviour                                              |
+/// |---------------|--------------------------------------------------------|
+/// | `None`        | unlimited (default, ~2200× real time)                 |
+/// | `Some(1.0)`   | real-time: 1 simulated second ≈ 1 wall-clock second   |
+/// | `Some(100.0)` | 100× real time                                        |
+/// | `Some(1000.0)`| 1000× real time                                       |
+#[derive(Clone, Debug)]
+pub struct SimConfig {
+    /// Total simulated duration in seconds (default: 86400 = 24 h).
+    ///
+    /// Converted to microseconds for BabbleSim's `-sim_length=<us>` argument.
+    /// The PHY terminates the simulation when this virtual time is reached,
+    /// causing all device processes to exit cleanly.
+    pub sim_length_secs: f64,
+    /// Optional real-time speed ratio via `bs_device_handbrake`.
+    ///
+    /// - `None` — no throttle; runs as fast as the host allows (~2200× real time)
+    /// - `Some(1.0)` — wall-clock speed (1 sim-second ≈ 1 real second)
+    /// - `Some(N)` — `N` simulated seconds per real second
+    pub speed: Option<f64>,
+}
+
+impl Default for SimConfig {
+    fn default() -> Self {
+        SimConfig {
+            sim_length_secs: 86400.0,
+            speed: None,
+        }
+    }
+}
+
+impl SimConfig {
+    /// Convert a simulated duration to its expected wall-clock duration.
+    ///
+    /// Returns `Some(wall)` when [`speed`](SimConfig::speed) is configured
+    /// (`wall = sim / speed`), or `None` when the simulation runs at
+    /// unlimited speed (no handbrake).  The caller can use the returned
+    /// duration directly as the argument to `std::thread::sleep` or
+    /// an equivalent async sleep.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use babble_bridge::SimConfig;
+    ///
+    /// let cfg = SimConfig { sim_length_secs: 60.0, speed: Some(40.0) };
+    /// // To wait for 1 simulated second at 40× speed:
+    /// let wall = cfg.wall_duration_for(Duration::from_secs(1));
+    /// assert_eq!(wall, Some(Duration::from_millis(25)));
+    /// ```
+    pub fn wall_duration_for(&self, sim_duration: std::time::Duration) -> Option<std::time::Duration> {
+        self.speed
+            .map(|s| sim_duration.div_f64(s))
+    }
+}
 
 /// Controls where the simulation process output (stdout/stderr) is forwarded
 /// when [`spawn_zephyr_rpc_server_with_socat`] is called.
@@ -89,6 +194,25 @@ pub enum LogOutput {
 /// All child processes are killed when this value is dropped.
 pub struct TestProcesses {
     children: Vec<Child>,
+    /// PID of the `bs_2G4_phy_v1` process.
+    ///
+    /// The PHY is the simulation clock master and exits when the configured
+    /// [`SimConfig::sim_length_secs`] of simulated time has elapsed.  After
+    /// calling [`std::mem::forget`] on this struct (as `cargo xtask start-sim`
+    /// does to keep processes alive after the command exits), you can monitor
+    /// `/proc/<phy_pid>` to detect when the simulation has finished.
+    pub phy_pid: u32,
+    /// The real-time speed ratio this simulation was started with.
+    ///
+    /// Mirrors [`SimConfig::speed`]:
+    /// - `Some(s)` — `bs_device_handbrake -r={s}` is running; the simulation
+    ///   advances `s` simulated seconds per wall-clock second.
+    ///   Use [`SimConfig::wall_duration_for`] to convert a simulated duration
+    ///   to the wall-clock sleep your host code should use.
+    /// - `None` — no handbrake; the simulation runs as fast as the CPU allows
+    ///   (~2200× on typical hardware for simple workloads; measure with
+    ///   `cargo xtask run-bsim --cgm-peripheral --sim-length 60`).
+    pub configured_speed: Option<f64>,
     /// Combined stdout lines from every process whose stdout was captured.
     stdout_lines: Arc<Mutex<Vec<String>>>,
 }
@@ -218,6 +342,7 @@ where
 /// Spawn a background thread that drains `stream` line by line and appends
 /// each line to the file at `path`.  The file must already exist (caller
 /// creates/truncates it before spawning child processes).
+#[cfg(test)]
 fn pipe_to_file<R>(stream: R, path: PathBuf)
 where
     R: std::io::Read + Send + 'static,
@@ -237,17 +362,8 @@ where
     });
 }
 
-// ── Public function ───────────────────────────────────────────────────────────
+// ── Public functions ──────────────────────────────────────────────────────────
 
-/// Spawns the full BabbleSim simulation stack for a single test:
-///
-/// 1. `bs_2G4_phy_v1`  — the radio PHY simulator
-/// 2. `zephyr_rpc_server_app` — Zephyr nRF RPC server with `-uart0_pty`
-/// 3. `cgm_peripheral_sample` — CGM BLE peripheral
-///
-/// The function waits up to 10 seconds for `zephyr_rpc_server_app` to print
-/// its PTY path on stdout (`"UART_0 connected to pseudotty: /dev/pts/N"`),
-/// then launches `socat` to bridge that PTY to a UNIX socket at
 /// Kills any leftover BabbleSim processes from a previous run with the given
 /// `sim_id`. Debugger stops and abnormal exits leave orphaned child processes
 /// that hold the sim_id and block the next launch.
@@ -256,6 +372,7 @@ pub(crate) fn kill_stale_sim_processes(sim_id: &str) {
         format!("bs_2G4_phy_v1.*-s={sim_id}"),
         format!("zephyr_rpc_server_app.*-s={sim_id}"),
         format!("cgm_peripheral_sample.*-s={sim_id}"),
+        format!("bs_device_handbrake.*-s={sim_id}"),
         format!("socat.*{sim_id}.sock"),
     ];
     for pat in &patterns {
@@ -290,6 +407,16 @@ pub(crate) fn kill_stale_sim_processes(sim_id: &str) {
     }
 }
 
+/// Spawns the full BabbleSim simulation stack for a single test:
+///
+/// 1. `bs_2G4_phy_v1`  — the radio PHY simulator
+/// 2. `zephyr_rpc_server_app` — Zephyr nRF RPC server with `-uart0_pty`
+/// 3. `cgm_peripheral_sample` — CGM BLE peripheral
+/// 4. `bs_device_handbrake` — optional real-time throttle (when `sim.speed` is `Some`)
+///
+/// The function waits up to 30 seconds for `zephyr_rpc_server_app` to print
+/// its PTY path on stdout (`"UART_0 connected to pseudotty: /dev/pts/N"`),
+/// then launches `socat` to bridge that PTY to a UNIX socket at
 /// `tests_dir/<test_name>.sock`.
 ///
 /// # Panics
@@ -300,6 +427,7 @@ pub fn spawn_zephyr_rpc_server_with_socat(
     tests_dir: &Path,
     test_name: &str,
     log: LogOutput,
+    sim: SimConfig,
 ) -> (TestProcesses, PathBuf) {
     let verbose = matches!(log, LogOutput::Stream | LogOutput::Both(_));
     // In persistent mode the child processes write directly to open file
@@ -348,6 +476,12 @@ pub fn spawn_zephyr_rpc_server_with_socat(
     kill_stale_sim_processes(sim_id);
     let _ = std::fs::remove_file(&socket_path);
 
+    // Compute PHY arguments from SimConfig.
+    // BabbleSim uses microseconds for sim_length; multiply seconds by 1e6.
+    let sim_length_arg = format!("-sim_length={}", (sim.sim_length_secs * 1_000_000.0) as u64);
+    // Handbrake occupies one extra device slot when speed throttling is requested.
+    let device_count = if sim.speed.is_some() { 3 } else { 2 };
+
     // ── 1. PHY ──────────────────────────────────────────────────────────────
     // Persistent mode: pass an open file FD directly to the child so it
     // keeps writing after the parent exits.  Non-persistent: use a pipe so
@@ -366,8 +500,8 @@ pub fn spawn_zephyr_rpc_server_with_socat(
     let mut phy = Command::new("./bs_2G4_phy_v1")
         .args([
             &format!("-s={sim_id}"),
-            "-D=2", // 2 radio devices: zephyr_rpc_server_app (d=0) + cgm_peripheral_sample (d=1)
-            "-sim_length=86400e6",
+            &format!("-D={device_count}"),
+            &sim_length_arg,
         ])
         .current_dir(bsim_bin)
         .stdin(Stdio::null())
@@ -617,6 +751,37 @@ pub fn spawn_zephyr_rpc_server_with_socat(
         pipe_labeled(stderr, "cgm");
     }
 
+    // ── 3.5. Handbrake (optional speed throttle) ─────────────────────────────
+    //
+    // `bs_device_handbrake -r=<N>` stalls the simulation every poke_period
+    // to keep the ratio of simulated time to wall-clock time at N:1.
+    //   N=1    → real-time  (1 simulated second ≈ 1 wall-clock second)
+    //   N=1000 → 1000× faster than real time
+    //
+    // Without the handbrake, BabbleSim runs as fast as the CPU allows
+    // (~2200× real time on typical hardware).
+    let handbrake: Option<Child> = if let Some(speed) = sim.speed {
+        let hb = Command::new("./bs_device_handbrake")
+            .args([
+                &format!("-s={sim_id}"),
+                "-d=2",
+                &format!("-r={speed}"),
+            ])
+            .current_dir(bsim_bin)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("BSIM_OUT_PATH", bsim_out)
+            .env("BSIM_COMPONENTS_PATH", bsim_comp)
+            .env("LD_LIBRARY_PATH", &ld_path)
+            .process_group(0)
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn bs_device_handbrake: {e}"));
+        Some(hb)
+    } else {
+        None
+    };
+
     // ── 4. Wait for PTY path ─────────────────────────────────────────────────
     let pty_path = pty_rx
         .recv_timeout(Duration::from_secs(30))
@@ -651,8 +816,16 @@ pub fn spawn_zephyr_rpc_server_with_socat(
             )
         });
 
+    let phy_pid = phy.id();
+    let configured_speed = sim.speed;
+    let mut children = vec![phy, zephyr_proc, cgm, socat];
+    if let Some(hb) = handbrake {
+        children.push(hb);
+    }
     let processes = TestProcesses {
-        children: vec![phy, zephyr_proc, cgm, socat],
+        children,
+        phy_pid,
+        configured_speed,
         stdout_lines,
     };
 
@@ -673,6 +846,8 @@ mod tests {
         ));
         TestProcesses {
             children: vec![],
+            phy_pid: 0,
+            configured_speed: None,
             stdout_lines: buf,
         }
     }
@@ -972,7 +1147,6 @@ mod tests {
             let file = std::fs::File::open(&read_path).unwrap();
             let mut reader = BufReader::new(file);
             let start = std::time::Instant::now();
-            let mut pty_sent = false;
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
@@ -986,14 +1160,10 @@ mod tests {
                     Ok(_) => {
                         let line =
                             line.trim_end_matches('\n').trim_end_matches('\r').to_string();
-                        if !pty_sent {
-                            if let Some(idx) = line.find("connected to pseudotty: ") {
-                                let pty_str =
-                                    line[idx + "connected to pseudotty: ".len()..].trim();
-                                tx.send(PathBuf::from(pty_str)).unwrap();
-                                pty_sent = true;
-                                break;
-                            }
+                        if let Some(idx) = line.find("connected to pseudotty: ") {
+                            let pty_str = line[idx + "connected to pseudotty: ".len()..].trim();
+                            tx.send(PathBuf::from(pty_str)).unwrap();
+                            break;
                         }
                     }
                     Err(e) => panic!("read_line error: {e}"),
@@ -1008,5 +1178,112 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("PTY path should have been sent");
         assert_eq!(pty, PathBuf::from("/dev/pts/42"));
+    }
+
+    // ── SimConfig::wall_duration_for ──────────────────────────────────────────
+
+    #[test]
+    fn sim_config_default_is_24h_unlimited() {
+        let cfg = SimConfig::default();
+        assert_eq!(cfg.sim_length_secs, 86400.0);
+        assert_eq!(cfg.speed, None);
+    }
+
+    #[test]
+    fn wall_duration_no_speed_returns_none() {
+        let cfg = SimConfig { sim_length_secs: 60.0, speed: None };
+        assert_eq!(cfg.wall_duration_for(Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn wall_duration_speed_40x() {
+        // 1 simulated second / 40× = 25 ms wall time
+        let cfg = SimConfig { sim_length_secs: 60.0, speed: Some(40.0) };
+        assert_eq!(
+            cfg.wall_duration_for(Duration::from_secs(1)),
+            Some(Duration::from_millis(25)),
+        );
+    }
+
+    #[test]
+    fn wall_duration_realtime_speed_1x() {
+        // 1:1 — wall time equals sim time
+        let cfg = SimConfig { sim_length_secs: 60.0, speed: Some(1.0) };
+        assert_eq!(
+            cfg.wall_duration_for(Duration::from_secs(10)),
+            Some(Duration::from_secs(10)),
+        );
+    }
+
+    #[test]
+    fn wall_duration_speed_1000x() {
+        // 500 ms sim / 1000× = 500 µs wall
+        let cfg = SimConfig { sim_length_secs: 60.0, speed: Some(1000.0) };
+        assert_eq!(
+            cfg.wall_duration_for(Duration::from_millis(500)),
+            Some(Duration::from_micros(500)),
+        );
+    }
+
+    #[test]
+    fn wall_duration_scales_with_magnitude() {
+        let cfg = SimConfig { sim_length_secs: 60.0, speed: Some(100.0) };
+        // 1 min sim / 100× = 600 ms wall
+        assert_eq!(
+            cfg.wall_duration_for(Duration::from_secs(60)),
+            Some(Duration::from_millis(600)),
+        );
+    }
+
+    // ── read_sim_speed ────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_sim_speed_reads_float() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("test.speed"), "40.0\n").unwrap();
+        assert_eq!(read_sim_speed(dir.path(), "test"), Some(40.0));
+    }
+
+    #[test]
+    fn read_sim_speed_reads_integer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sim.speed"), "1000\n").unwrap();
+        assert_eq!(read_sim_speed(dir.path(), "sim"), Some(1000.0));
+    }
+
+    #[test]
+    fn read_sim_speed_zero_means_unlimited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("s.speed"), "0\n").unwrap();
+        assert_eq!(read_sim_speed(dir.path(), "s"), Some(0.0));
+    }
+
+    #[test]
+    fn read_sim_speed_missing_file_returns_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_sim_speed(dir.path(), "nonexistent"), None);
+    }
+
+    #[test]
+    fn read_sim_speed_invalid_content_returns_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("bad.speed"), "not_a_number\n").unwrap();
+        assert_eq!(read_sim_speed(dir.path(), "bad"), None);
+    }
+
+    #[test]
+    fn read_sim_speed_trims_whitespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("ws.speed"), "  97.6  \n").unwrap();
+        assert_eq!(read_sim_speed(dir.path(), "ws"), Some(97.6));
+    }
+
+    #[test]
+    fn sim_length_to_microseconds_conversion() {
+        // The PHY -sim_length= argument is in microseconds.
+        // 300 s → 300_000_000 µs (fits in u64, no overflow)
+        assert_eq!((300.0_f64 * 1_000_000.0) as u64, 300_000_000);
+        // Original hard-coded value 86400e6 matches our formula.
+        assert_eq!((86400.0_f64 * 1_000_000.0) as u64, 86_400_000_000);
     }
 }

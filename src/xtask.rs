@@ -86,7 +86,9 @@ fn run() -> Result<()> {
             let args: Vec<String> = args.collect();
             let nrf_rpc_server = args.iter().any(|a| a == "--nrf-rpc-server");
             let cgm_peripheral = args.iter().any(|a| a == "--cgm-peripheral");
-            run_bsim(nrf_rpc_server, cgm_peripheral)
+            let sim_length_secs = parse_sim_length(&args)?;
+            let speed = parse_speed(&args)?;
+            run_bsim(nrf_rpc_server, cgm_peripheral, sim_length_secs, speed)
         }
         "start-sim" => {
             let args: Vec<String> = args.collect();
@@ -94,6 +96,8 @@ fn run() -> Result<()> {
             let use_docker = args.iter().any(|a| a == "--container");
             let log_stream = args.iter().any(|a| a == "--log-stream");
             let log_dir = parse_sim_flag(&args, "--log-dir").map(PathBuf::from);
+            let sim_length_secs = parse_sim_length(&args)?;
+            let speed = parse_speed(&args)?;
             if use_docker {
                 // Default to a path inside the container (workspace is
                 // bind-mounted at /workspace).
@@ -114,13 +118,13 @@ fn run() -> Result<()> {
                 } else {
                     crate::LogOutput::WriteToDir(log_dir)
                 };
-                cmd_start_sim(sim_id, &sim_dir, log)
+                cmd_start_sim(sim_id, &sim_dir, log, sim_length_secs, speed)
             }
         }
         "stop-sim" => {
             require_linux("stop-sim")?;
             let args: Vec<String> = args.collect();
-            let sim_id = parse_sim_flag(&args, "--sim-id").unwrap_or("insulin_pump");
+            let sim_id = parse_sim_flag(&args, "--sim-id").unwrap_or("sim");
             cmd_stop_sim(sim_id)
         }
         "list-sims" => cmd_list_sims(),
@@ -176,43 +180,66 @@ fn run() -> Result<()> {
 }
 
 fn print_usage() {
+    // Descriptions start at column 37 (36 chars of left content before them).
+    // Commands:  2-space indent  + name padded to 36 chars
+    // Flags:     4-space indent  + flag+arg padded to 36 chars
+    // Continuation lines: 36 leading spaces to align with description column
+    println!("cargo xtask  —  BabbleSim/Zephyr simulation task runner");
+    println!();
     println!("Usage: cargo xtask <command> [options]");
     println!();
-    println!("Commands:");
-    println!("  docker-build                      Build the dev-container image");
-    println!("  docker-attach                     Open an interactive shell in the container");
-    println!("  docker-run [--] <cmd> [args...]   Run a command non-interactively in the container (for CI)");
+    println!("Simulation commands (Linux only):");
     println!();
-    println!("  zephyr-setup [--clean]            Set up Zephyr/BabbleSim (prompts for install mode)");
-    println!("    --prebuilt                      Fetch prebuilt binaries from GitHub Releases");
-    println!("    --build-from-source             Build from source (non-interactive, for CI)");
+    println!("  start-sim                    Start sim stack in background; print socket path.");
+    println!("                               With --sim-length, block until sim ends then clean up.");
+    println!("    --sim-id <id>              Simulation identifier  [default: sim]");
+    println!("    --sim-dir <path>           Socket file directory  [default: <workspace>/tests/sockets]");
+    println!("    --log-dir <path>           Write rpc-server.log, cgm.log, phy.log here;");
+    println!("                               truncated at start of each run  [default: <sim-dir>/logs]");
+    println!("    --log-stream               Also stream process output to terminal with [label] prefixes");
+    println!("    --sim-length <dur>         Simulated duration: '300' (s), '5m', '2h'  [default: 86400 s]");
+    println!("    --speed <N>               Real-time ratio: 1 = wall-clock, 1000 = 1000×  [default: unlimited]");
+    println!("    --container               Run inside dev-container (macOS workaround)");
     println!();
-    println!("  run-bsim                          Run BabbleSim simulation (Linux only)");
-    println!("    --nrf-rpc-server                Launch the nRF RPC server (default: on)");
-    println!("    --cgm-peripheral                Launch the CGM peripheral sample (default: on)");
+    println!("  stop-sim                     Kill all processes for a running simulation");
+    println!("    --sim-id <id>              Simulation to stop  [default: sim]");
     println!();
-    println!("  start-sim                         Start simulation stack in the background (Linux only)");
-    println!("    --sim-id <id>                   Simulation identifier (default: sim)");
-    println!("    --sim-dir <path>                Directory for the socket file (default: <workspace>/tests/sockets)");
-    println!("    --container                     Build image if needed and run inside a container (macOS)");
-    println!("    --log-stream                    Stream all process output to this terminal with [label] prefixes");
-    println!("    --log-dir <path>                Directory for log files (default: <sim-dir>/logs);");
-    println!("                                    writes rpc-server.log, cgm.log, phy.log; truncated each run;");
-    println!("                                    combine with --log-stream to also stream to terminal");
-    println!("    Prints the socket path on success.");
+    println!("  run-bsim                     Run BabbleSim interactively in the foreground");
+    println!("    --nrf-rpc-server           Include nRF RPC server device  [default: on]");
+    println!("    --cgm-peripheral           Include CGM peripheral device  [default: on]");
+    println!("    --sim-length <dur>         Simulated duration  [default: 86400 s]");
+    println!("    --speed <N>               Real-time ratio  [default: unlimited]");
     println!();
-    println!("  stop-sim                          Stop a running simulation (Linux only)");
-    println!("    --sim-id <id>                   Simulation identifier to stop (default: insulin_pump)");
+    println!("  list-sims                    List all currently running simulations");
     println!();
-    println!("  list-sims                         List all currently running simulations");
+    println!("  tail-logs                    Follow sim log files (blocks; Ctrl+C to stop)");
+    println!("    --log-dir <path>           Directory containing {{rpc-server,cgm,phy}}.log");
+    println!("    --container               Follow logs inside the running sim container");
     println!();
-    println!("  tail-logs                         Follow log files written by --log-dir (blocks until Ctrl+C)");
-    println!("    --log-dir <path>                Directory containing {{rpc-server,cgm,phy}}.log");
-    println!("    --container                     Follow logs inside the running sim container");
+    println!("  clean-sockets                Remove stale *.sock files from tests/sockets/");
     println!();
-    println!("  clean-sockets                     Remove all *.sock files from <workspace>/tests/sockets/");
+    println!("Speed / duration flags (start-sim, run-bsim):");
     println!();
-    println!("  exec [--] <cmd> [args...]          Run a command inside the sim container (where the socket is reachable)");
+    println!("  --sim-length <dur>           Simulated duration in seconds, minutes, or hours.");
+    println!("                               Examples: 300  300s  5m  2h  [default: 86400 s = 24 h]");
+    println!("  --speed <N>                  Real-time ratio via bs_device_handbrake.");
+    println!("                               1 = wall-clock speed; 1000 = 1000× faster than real time.");
+    println!("                               Without this flag the sim runs as fast as the CPU allows");
+    println!("                               (~2200× real time on typical hardware).");
+    println!();
+    println!("Setup:");
+    println!();
+    println!("  zephyr-setup                 Set up Zephyr/BabbleSim (prompts for mode)");
+    println!("    --prebuilt                 Download prebuilt binaries from GitHub Releases");
+    println!("    --build-from-source        Build from source (~30 min, requires Zephyr toolchain)");
+    println!("    --clean                    Wipe external/ before setup");
+    println!();
+    println!("Container / Docker:");
+    println!();
+    println!("  docker-build                 Build the dev-container image");
+    println!("  docker-attach                Open an interactive shell in the container");
+    println!("  docker-run [--] <cmd>        Run a command non-interactively in the container");
+    println!("  exec [--] <cmd>              Exec a command in the running sim container");
 }
 
 fn require_linux(cmd: &str) -> Result<()> {
@@ -814,15 +841,89 @@ fn parse_sim_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .map(|w| w[1].as_str())
 }
 
+/// Parse `--sim-length <value>` from `args`, returning the duration in seconds.
+///
+/// Accepted formats: bare number (`300`), seconds suffix (`300s`),
+/// minutes suffix (`5m`), hours suffix (`2h`).  Returns `None` when the flag
+/// is absent (caller uses the default 24 h).
+fn parse_sim_length(args: &[String]) -> Result<Option<f64>> {
+    let val = match parse_sim_flag(args, "--sim-length") {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    let (num_str, mult): (&str, f64) = if val.ends_with('h') {
+        (&val[..val.len() - 1], 3600.0)
+    } else if val.ends_with('m') {
+        (&val[..val.len() - 1], 60.0)
+    } else if val.ends_with('s') {
+        (&val[..val.len() - 1], 1.0)
+    } else {
+        (val, 1.0)
+    };
+    let secs: f64 = num_str.parse().map_err(|_| {
+        format!(
+            "--sim-length: invalid value '{val}' \
+             (expected a number optionally followed by s/m/h, e.g. '300', '5m', '2h')"
+        )
+    })?;
+    if secs <= 0.0 {
+        return Err("--sim-length must be a positive number".into());
+    }
+    Ok(Some(secs * mult))
+}
+
+/// Parse `--speed <value>` from `args`, returning the real-time ratio for
+/// `bs_device_handbrake`.
+///
+/// - `1.0`    → real-time (1 simulated second ≈ 1 wall-clock second)
+/// - `1000.0` → 1000× faster than real time
+///
+/// Returns `None` when the flag is absent (no speed throttle).
+fn parse_speed(args: &[String]) -> Result<Option<f64>> {
+    let val = match parse_sim_flag(args, "--speed") {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    let speed: f64 = val.parse().map_err(|_| {
+        format!(
+            "--speed: invalid value '{val}' \
+             (expected a positive number, e.g. '1' for real-time or '1000' for 1000× real time)"
+        )
+    })?;
+    if speed <= 0.0 {
+        return Err("--speed must be a positive number".into());
+    }
+    Ok(Some(speed))
+}
+
 /// `cargo xtask start-sim` — launch the full simulation stack in the background.
 ///
-/// Spawns PHY + `zephyr_rpc_server_app` + `cgm_peripheral_sample` + `socat`,
-/// waits until the UNIX socket at `<sim_dir>/<sim_id>.sock` is connectable,
-/// then prints the socket path and exits, leaving all child processes running.
-fn cmd_start_sim(sim_id: &str, sim_dir: &Path, log: crate::LogOutput) -> Result<()> {
+/// Spawns PHY + `zephyr_rpc_server_app` + `cgm_peripheral_sample` + `socat`
+/// (and optionally `bs_device_handbrake` for speed control), waits until the
+/// UNIX socket at `<sim_dir>/<sim_id>.sock` is connectable, then prints the
+/// socket path.
+///
+/// **When `sim_length_secs` is `Some`** the command blocks until the PHY
+/// process exits (i.e. the simulation reaches its configured end time), then
+/// runs full cleanup — killing any remaining processes and removing IPC files.
+/// Log files are left intact.
+///
+/// **When `sim_length_secs` is `None`** the command exits immediately after
+/// printing the socket path, leaving all child processes running (original
+/// behaviour).
+fn cmd_start_sim(
+    sim_id: &str,
+    sim_dir: &Path,
+    log: crate::LogOutput,
+    sim_length_secs: Option<f64>,
+    speed: Option<f64>,
+) -> Result<()> {
     // Verify required binaries exist before attempting to spawn anything.
     let bsim_bin = Path::new("external/tools/bsim/bin");
-    let required = ["bs_2G4_phy_v1", "zephyr_rpc_server_app", "cgm_peripheral_sample"];
+    let mut required = vec!["bs_2G4_phy_v1", "zephyr_rpc_server_app", "cgm_peripheral_sample"];
+    if speed.is_some() {
+        required.push("bs_device_handbrake");
+    }
     let missing: Vec<&str> = required
         .iter()
         .copied()
@@ -838,8 +939,14 @@ fn cmd_start_sim(sim_id: &str, sim_dir: &Path, log: crate::LogOutput) -> Result<
         .into());
     }
 
+    let sim = crate::SimConfig {
+        sim_length_secs: sim_length_secs.unwrap_or(86400.0),
+        speed,
+    };
+    let block_until_done = sim_length_secs.is_some();
+
     let (processes, socket_path) =
-        crate::spawn_zephyr_rpc_server_with_socat(sim_dir, sim_id, log);
+        crate::spawn_zephyr_rpc_server_with_socat(sim_dir, sim_id, log, sim);
 
     // Wait until socat is actually listening on the socket before we exit.
     // socat needs a moment after spawning before it accepts connections.
@@ -858,12 +965,56 @@ fn cmd_start_sim(sim_id: &str, sim_dir: &Path, log: crate::LogOutput) -> Result<
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    // Capture PHY PID before forgetting the process handles.
+    let phy_pid = processes.phy_pid;
+
+    // Write a <sim_id>.speed file next to the socket so that host-side
+    // library code can read the conversion factor without any out-of-band
+    // communication.  The value is the configured real-time ratio:
+    //   wall_duration = sim_duration / speed
+    // A value of 0.0 means "unlimited" (no handbrake; measure experimentally).
+    let speed_path = sim_dir.join(format!("{sim_id}.speed"));
+    let speed_val = speed.unwrap_or(0.0);
+    let _ = fs::write(&speed_path, format!("{speed_val}\n"));
+
     // IMPORTANT: prevent TestProcesses::drop() from calling kill_all().
     // Without this the Drop impl would kill every child process the instant
     // cmd_start_sim returns, tearing down the sim before the caller can use it.
     std::mem::forget(processes);
 
     println!("{}", socket_path.display());
+
+    if block_until_done {
+        let sim_secs = sim_length_secs.unwrap();
+        let expected_wall_secs = match speed {
+            None => sim_secs / 2200.0,
+            Some(s) => sim_secs / s,
+        };
+        let speed_desc = match speed {
+            None => format!("~{:.2} s wall time at ~2200× speed", expected_wall_secs),
+            Some(s) => format!("~{:.2} s wall time at {s}× speed", expected_wall_secs),
+        };
+        eprintln!("Simulation running: {sim_secs} s simulated ({speed_desc}).");
+        eprintln!("Waiting for PHY (pid {phy_pid}) to exit…");
+
+        let wall_start = Instant::now();
+        while pid_is_alive(phy_pid) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let wall_elapsed = wall_start.elapsed().as_secs_f64();
+
+        eprintln!(
+            "Simulation finished: {wall_elapsed:.2} s wall time  \
+             (expected ~{expected_wall_secs:.2} s, ratio {:.1}×)",
+            sim_secs / wall_elapsed,
+        );
+        eprintln!("Cleaning up…");
+        crate::kill_stale_sim_processes(sim_id);
+        let _ = fs::remove_file(&socket_path);
+        let _ = fs::remove_file(sim_dir.join(format!("{sim_id}.speed")));
+        eprintln!("Done. Logs remain in the configured log directory.");
+    }
+
     Ok(())
 }
 
@@ -1151,7 +1302,32 @@ fn cmd_list_sims() -> Result<()> {
 
 /// `cargo xtask stop-sim` — kill all processes belonging to a running simulation.
 fn cmd_stop_sim(sim_id: &str) -> Result<()> {
+    let patterns = [
+        format!("bs_2G4_phy_v1.*-s={sim_id}"),
+        format!("zephyr_rpc_server_app.*-s={sim_id}"),
+        format!("cgm_peripheral_sample.*-s={sim_id}"),
+        format!("socat.*{sim_id}.sock"),
+    ];
+    let any_running = patterns.iter().any(|pat| {
+        Command::new("pgrep")
+            .args(["-f", pat])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
+
+    if !any_running {
+        eprintln!("No running processes found for simulation '{sim_id}'.");
+        return Err(format!("simulation '{sim_id}' was not running").into());
+    }
+
     crate::kill_stale_sim_processes(sim_id);
+    // Remove the speed file so stale values are never read by a future run.
+    let root = workspace_root()?;
+    let sockets_dir = root.join("tests/sockets");
+    let _ = fs::remove_file(sockets_dir.join(format!("{sim_id}.speed")));
     println!("Stopped simulation '{sim_id}'");
     Ok(())
 }
@@ -1185,6 +1361,14 @@ fn cmd_clean_sockets(root: &Path) -> Result<()> {
 }
 
 // ── BabbleSim runner ─────────────────────────────────────────────────────────
+
+/// Returns `true` while the process with `pid` is still running on Linux.
+///
+/// Checks for the presence of `/proc/<pid>` — reliable on Linux, which is
+/// the only supported OS for sim commands (`require_linux`).
+fn pid_is_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
 
 fn bsim_ld_library_path() -> String {
     match env::var("LD_LIBRARY_PATH") {
@@ -1226,12 +1410,20 @@ fn generate_sim_id() -> String {
     format!("sim_{:08x}", nanos ^ (pid << 16))
 }
 
-fn run_bsim(nrf_rpc_server: bool, cgm_peripheral: bool) -> Result<()> {
+fn run_bsim(
+    nrf_rpc_server: bool,
+    cgm_peripheral: bool,
+    sim_length_secs: Option<f64>,
+    speed: Option<f64>,
+) -> Result<()> {
     let (run_nrf, run_cgm) = if !nrf_rpc_server && !cgm_peripheral {
         (true, true)
     } else {
         (nrf_rpc_server, cgm_peripheral)
     };
+
+    let sim_length = sim_length_secs.unwrap_or(86400.0);
+    let sim_length_us = format!("-sim_length={}", (sim_length * 1_000_000.0) as u64);
 
     let sim_id = generate_sim_id();
     pkill_sim(&sim_id);
@@ -1242,7 +1434,12 @@ fn run_bsim(nrf_rpc_server: bool, cgm_peripheral: bool) -> Result<()> {
         &sim_id
     ));
 
-    let device_count = (run_nrf as u32) + (run_cgm as u32);
+    let nrf_device_idx: u32 = 0;
+    let cgm_device_idx: u32 = run_nrf as u32;
+    // Handbrake gets the last device slot when speed throttling is requested.
+    let base_device_count = (run_nrf as u32) + (run_cgm as u32);
+    let device_count = if speed.is_some() { base_device_count + 1 } else { base_device_count };
+    let handbrake_device_idx = base_device_count;
 
     const SEP: &str = "────────────────────────────────────────────────────────────";
 
@@ -1253,12 +1450,9 @@ fn run_bsim(nrf_rpc_server: bool, cgm_peripheral: bool) -> Result<()> {
         &[
             &format!("-s={sim_id}"),
             &format!("-D={device_count}"),
-            "-sim_length=86400e6",
+            &sim_length_us,
         ],
     )?;
-
-    let nrf_device_idx: u32 = 0;
-    let cgm_device_idx: u32 = run_nrf as u32;
 
     let mut nrf_proc = if run_nrf {
         println!("  Starting nRF RPC server (device {nrf_device_idx})...");
@@ -1295,16 +1489,35 @@ fn run_bsim(nrf_rpc_server: bool, cgm_peripheral: bool) -> Result<()> {
         None
     };
 
+    if let Some(s) = speed {
+        println!("  Starting handbrake (device {handbrake_device_idx}, speed {s}×)...");
+        spawn_in_bsim_bin(
+            &sim_id,
+            "./bs_device_handbrake",
+            &[
+                &format!("-s={sim_id}"),
+                &format!("-d={handbrake_device_idx}"),
+                &format!("-r={s}"),
+            ],
+        )?;
+    }
+
     let mut device_list = Vec::new();
     if run_nrf { device_list.push(format!("nrf-rpc-server [d={nrf_device_idx}]")); }
     if run_cgm { device_list.push(format!("cgm-peripheral [d={cgm_device_idx}]")); }
+    if speed.is_some() { device_list.push(format!("handbrake [d={handbrake_device_idx}]")); }
     let device_str = device_list.join(", ");
+
+    let wall_time_estimate = match speed {
+        Some(s) => format!("~{:.1} s wall time at {s}× speed", sim_length / s),
+        None => format!("~{:.1} s wall time at ~2200× speed", sim_length / 2200.0),
+    };
 
     println!();
     println!("{SEP}");
     println!("  Simulation ID : {sim_id}");
     println!("  Devices       : {device_str}");
-    println!("  Duration      : 86400 s  (~24 h simulated, ~39 s real time)");
+    println!("  Duration      : {sim_length} s simulated ({wall_time_estimate})");
     println!("{SEP}");
 
     if run_nrf {
@@ -1319,6 +1532,8 @@ fn run_bsim(nrf_rpc_server: bool, cgm_peripheral: bool) -> Result<()> {
     println!();
     println!("  Press Ctrl+C to stop.");
     println!();
+
+    let wall_start = Instant::now();
 
     if let Some(ref mut proc) = nrf_proc {
         let status = proc.wait()?;
@@ -1335,5 +1550,145 @@ fn run_bsim(nrf_rpc_server: bool, cgm_peripheral: bool) -> Result<()> {
         }
     }
 
+    let wall_elapsed = wall_start.elapsed().as_secs_f64();
+    let expected_wall_secs = match speed {
+        Some(s) => sim_length / s,
+        None => sim_length / 2200.0,
+    };
+    println!();
+    println!("{SEP}");
+    println!(
+        "  Wall time   : {wall_elapsed:.2} s  \
+         (expected ~{expected_wall_secs:.2} s, actual ratio {:.1}×)",
+        sim_length / wall_elapsed,
+    );
+    println!("{SEP}");
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: build an args slice with a single named flag and its value.
+    fn flag(name: &str, val: &str) -> Vec<String> {
+        vec![name.to_string(), val.to_string()]
+    }
+
+    fn no_flags() -> Vec<String> {
+        vec![]
+    }
+
+    // ── parse_sim_length ──────────────────────────────────────────────────────
+
+    #[test]
+    fn sim_length_absent_returns_none() {
+        assert_eq!(parse_sim_length(&no_flags()).unwrap(), None);
+    }
+
+    #[test]
+    fn sim_length_bare_number_is_seconds() {
+        assert_eq!(
+            parse_sim_length(&flag("--sim-length", "300")).unwrap(),
+            Some(300.0),
+        );
+    }
+
+    #[test]
+    fn sim_length_seconds_suffix() {
+        assert_eq!(
+            parse_sim_length(&flag("--sim-length", "300s")).unwrap(),
+            Some(300.0),
+        );
+    }
+
+    #[test]
+    fn sim_length_minutes_suffix() {
+        assert_eq!(
+            parse_sim_length(&flag("--sim-length", "5m")).unwrap(),
+            Some(300.0),
+        );
+    }
+
+    #[test]
+    fn sim_length_hours_suffix() {
+        assert_eq!(
+            parse_sim_length(&flag("--sim-length", "2h")).unwrap(),
+            Some(7200.0),
+        );
+    }
+
+    #[test]
+    fn sim_length_fractional_minutes() {
+        assert_eq!(
+            parse_sim_length(&flag("--sim-length", "1.5m")).unwrap(),
+            Some(90.0),
+        );
+    }
+
+    #[test]
+    fn sim_length_invalid_string_returns_err() {
+        assert!(parse_sim_length(&flag("--sim-length", "abc")).is_err());
+    }
+
+    #[test]
+    fn sim_length_negative_returns_err() {
+        assert!(parse_sim_length(&flag("--sim-length", "-5")).is_err());
+    }
+
+    #[test]
+    fn sim_length_zero_returns_err() {
+        assert!(parse_sim_length(&flag("--sim-length", "0")).is_err());
+    }
+
+    // ── parse_speed ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn speed_absent_returns_none() {
+        assert_eq!(parse_speed(&no_flags()).unwrap(), None);
+    }
+
+    #[test]
+    fn speed_integer() {
+        assert_eq!(parse_speed(&flag("--speed", "1000")).unwrap(), Some(1000.0));
+    }
+
+    #[test]
+    fn speed_float() {
+        assert_eq!(parse_speed(&flag("--speed", "0.5")).unwrap(), Some(0.5));
+    }
+
+    #[test]
+    fn speed_realtime() {
+        assert_eq!(parse_speed(&flag("--speed", "1")).unwrap(), Some(1.0));
+    }
+
+    #[test]
+    fn speed_invalid_string_returns_err() {
+        assert!(parse_speed(&flag("--speed", "fast")).is_err());
+    }
+
+    #[test]
+    fn speed_negative_returns_err() {
+        assert!(parse_speed(&flag("--speed", "-1")).is_err());
+    }
+
+    #[test]
+    fn speed_zero_returns_err() {
+        assert!(parse_speed(&flag("--speed", "0")).is_err());
+    }
+
+    // ── pid_is_alive ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn current_process_is_alive() {
+        assert!(pid_is_alive(std::process::id()));
+    }
+
+    #[test]
+    fn nonexistent_pid_is_not_alive() {
+        // u32::MAX is never a valid Linux PID (max is 4_194_304).
+        assert!(!pid_is_alive(u32::MAX));
+    }
 }

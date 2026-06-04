@@ -14,7 +14,7 @@ use babble_bridge::TestProcesses;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::{Path};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
@@ -161,8 +161,12 @@ fn start_sim(test_name: &str) -> (TestProcesses, SimUart) {
     } else {
         babble_bridge::LogOutput::Off
     };
-    let (processes, socket_path) =
-        babble_bridge::spawn_zephyr_rpc_server_with_socat(sockets_dir, test_name, log);
+    let (processes, socket_path) = babble_bridge::spawn_zephyr_rpc_server_with_socat(
+        sockets_dir,
+        test_name,
+        log,
+        babble_bridge::SimConfig::default(),
+    );
     let uart = SimUart::connect(&socket_path);
     (processes, uart)
 }
@@ -275,12 +279,12 @@ fn log_output_write_to_dir_creates_log_files() {
     let sockets_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/sockets"));
     let log = babble_bridge::LogOutput::WriteToDir(log_dir.path().to_path_buf());
 
-    let (mut processes, _socket_path) =
-        babble_bridge::spawn_zephyr_rpc_server_with_socat(
-            sockets_dir,
-            "log_output_write_to_dir_creates_log_files",
-            log,
-        );
+    let (mut processes, _socket_path) = babble_bridge::spawn_zephyr_rpc_server_with_socat(
+        sockets_dir,
+        "log_output_write_to_dir_creates_log_files",
+        log,
+        babble_bridge::SimConfig::default(),
+    );
 
     // Wait for Zephyr init so log files have meaningful content.
     processes.search_stdout_for_strings(HashSet::from([
@@ -321,6 +325,7 @@ fn log_output_write_to_dir_clears_logs_on_respawn() {
             sockets_dir,
             "log_output_clears_logs_respawn",
             log,
+            babble_bridge::SimConfig::default(),
         );
         // _processes drops here, killing all children.
     }
@@ -336,6 +341,7 @@ fn log_output_write_to_dir_clears_logs_on_respawn() {
             sockets_dir,
             "log_output_clears_logs_respawn",
             log,
+            babble_bridge::SimConfig::default(),
         );
         processes.search_stdout_for_strings(HashSet::from([
             "<inf> nrf_ps_server: Initializing RPC server",
@@ -360,6 +366,7 @@ fn log_output_off_creates_no_log_files() {
         sockets_dir,
         "log_output_off_creates_no_log_files",
         babble_bridge::LogOutput::Off,
+        babble_bridge::SimConfig::default(),
     );
 
     processes.search_stdout_for_strings(HashSet::from([
